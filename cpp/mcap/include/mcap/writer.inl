@@ -2,6 +2,15 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#if defined(_WIN32) || defined(_WIN64)
+#  include <io.h>
+#  define MCAP_FILENO(f) _fileno(f)
+#  define MCAP_FSYNC(fd) _commit(fd)
+#else
+#  include <unistd.h>
+#  define MCAP_FILENO(f) fileno(f)
+#  define MCAP_FSYNC(fd) fsync(fd)
+#endif
 #ifndef MCAP_COMPRESSION_NO_LZ4
 #  include <lz4frame.h>
 #  include <lz4hc.h>
@@ -43,13 +52,15 @@ FileWriter::~FileWriter() {
   end();
 }
 
-Status FileWriter::open(std::string_view filename) {
+Status FileWriter::open(std::string_view filename, uint64_t syncIntervalBytes) {
   end();
   file_ = std::fopen(filename.data(), "wb");
   if (!file_) {
     const auto msg = internal::StrCat("failed to open file \"", filename, "\" for writing");
     return Status(StatusCode::OpenFailed, msg);
   }
+  syncIntervalBytes_ = syncIntervalBytes;
+  bytesSinceLastSync_ = 0;
   return StatusCode::Success;
 }
 
@@ -59,20 +70,28 @@ void FileWriter::handleWrite(const std::byte* data, uint64_t size) {
   (void)written;
   assert(written == size);
   size_ += size;
+  bytesSinceLastSync_ += size;
 }
 
 void FileWriter::flush() {
   if (file_) {
     std::fflush(file_);
+    if (syncIntervalBytes_ > 0 && bytesSinceLastSync_ >= syncIntervalBytes_) {
+      MCAP_FSYNC(MCAP_FILENO(file_));
+      bytesSinceLastSync_ = 0;
+    }
   }
 }
 
 void FileWriter::end() {
   if (file_) {
+    std::fflush(file_);
+    MCAP_FSYNC(MCAP_FILENO(file_));
     std::fclose(file_);
     file_ = nullptr;
   }
   size_ = 0;
+  bytesSinceLastSync_ = 0;
 }
 
 uint64_t FileWriter::size() const {
@@ -343,7 +362,7 @@ Status McapWriter::open(const std::string_view filename, const McapWriterOptions
   // If the writer was opened, close it first
   close();
   fileOutput_ = std::make_unique<FileWriter>();
-  const auto status = fileOutput_->open(filename);
+  const auto status = fileOutput_->open(filename, options.fsyncIntervalBytes);
   if (!status.ok()) {
     fileOutput_.reset();
     return status;

@@ -104,6 +104,13 @@ struct MCAP_PUBLIC McapWriterOptions {
   bool noStatistics = false;
   bool noSummaryOffsets = false;
 
+  /**
+   * @brief If non-zero, call fsync after every N bytes flushed to disk. Provides
+   * periodic durability guarantees. Only applies when opening with a filename
+   * (FileWriter). Default 0 disables periodic fsync.
+   */
+  uint64_t fsyncIntervalBytes = 700ULL * 1024 * 1024;  // 700 MB
+
   McapWriterOptions(const std::string_view _profile)
       : profile(_profile) {}
 };
@@ -167,7 +174,13 @@ class MCAP_PUBLIC FileWriter final : public IWritable {
 public:
   ~FileWriter() override;
 
-  Status open(std::string_view filename);
+  /**
+   * @brief Open a file for writing.
+   * @param filename Path to the file.
+   * @param syncIntervalBytes If non-zero, call fsync after every N bytes flushed.
+   *   Default 0 disables periodic fsync.
+   */
+  Status open(std::string_view filename, uint64_t syncIntervalBytes = 0);
 
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
@@ -177,6 +190,8 @@ public:
 private:
   std::FILE* file_ = nullptr;
   uint64_t size_ = 0;
+  uint64_t bytesSinceLastSync_ = 0;
+  uint64_t syncIntervalBytes_ = 0;
 };
 
 /**
