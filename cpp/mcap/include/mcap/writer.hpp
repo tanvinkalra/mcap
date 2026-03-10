@@ -158,6 +158,11 @@ public:
    * own cadence. Defaults to a no-op.
    */
   virtual void flush() {}
+  /**
+   * @brief Ensures all written data is persisted to storage (e.g. fsync on POSIX).
+   * Defaults to a no-op. Only FileWriter performs a real sync.
+   */
+  virtual void sync() {}
 
 protected:
   virtual void handleWrite(const std::byte* data, uint64_t size) = 0;
@@ -185,6 +190,7 @@ public:
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
   void flush() override;
+  void sync() override;
   uint64_t size() const override;
 
 private:
@@ -417,10 +423,11 @@ public:
   /**
    * @brief Write a message to the output stream.
    *
-   * @param msg Message to add.
+   * @param message Message to add.
+   * @param fsyncAfter If true, flush and sync to storage after this write. Default false.
    * @return A non-zero error code on failure.
    */
-  Status write(const Message& message);
+  Status write(const Message& message, bool fsyncAfter = false);
 
   /**
    * @brief Write an attachment to the output stream.

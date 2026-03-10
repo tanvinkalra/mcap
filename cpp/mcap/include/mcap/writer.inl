@@ -83,6 +83,13 @@ void FileWriter::flush() {
   }
 }
 
+void FileWriter::sync() {
+  if (file_) {
+    std::fflush(file_);
+    MCAP_FSYNC(MCAP_FILENO(file_));
+  }
+}
+
 void FileWriter::end() {
   if (file_) {
     std::fflush(file_);
@@ -546,7 +553,7 @@ void McapWriter::addChannel(Channel& channel) {
   ++statistics_.channelCount;
 }
 
-Status McapWriter::write(const Message& message) {
+Status McapWriter::write(const Message& message, bool fsyncAfter) {
   if (!output_) {
     return StatusCode::NotOpen;
   }
@@ -631,6 +638,10 @@ Status McapWriter::write(const Message& message) {
     }
   }
 
+  if (fsyncAfter) {
+    output.flush();
+    output.sync();
+  }
   return StatusCode::Success;
 }
 
