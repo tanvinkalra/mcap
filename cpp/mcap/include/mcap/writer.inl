@@ -52,15 +52,13 @@ FileWriter::~FileWriter() {
   end();
 }
 
-Status FileWriter::open(std::string_view filename, uint64_t syncIntervalBytes) {
+Status FileWriter::open(std::string_view filename) {
   end();
   file_ = std::fopen(filename.data(), "wb");
   if (!file_) {
     const auto msg = internal::StrCat("failed to open file \"", filename, "\" for writing");
     return Status(StatusCode::OpenFailed, msg);
   }
-  syncIntervalBytes_ = syncIntervalBytes;
-  bytesSinceLastSync_ = 0;
   return StatusCode::Success;
 }
 
@@ -70,23 +68,14 @@ void FileWriter::handleWrite(const std::byte* data, uint64_t size) {
   (void)written;
   assert(written == size);
   size_ += size;
-  bytesSinceLastSync_ += size;
 }
 
-void FileWriter::flush() {
+void FileWriter::flush(bool forceSync) {
   if (file_) {
     std::fflush(file_);
-    if (syncIntervalBytes_ > 0 && bytesSinceLastSync_ >= syncIntervalBytes_) {
+    if (forceSync) {
       MCAP_FSYNC(MCAP_FILENO(file_));
-      bytesSinceLastSync_ = 0;
     }
-  }
-}
-
-void FileWriter::sync() {
-  if (file_) {
-    std::fflush(file_);
-    MCAP_FSYNC(MCAP_FILENO(file_));
   }
 }
 
@@ -98,7 +87,6 @@ void FileWriter::end() {
     file_ = nullptr;
   }
   size_ = 0;
-  bytesSinceLastSync_ = 0;
 }
 
 uint64_t FileWriter::size() const {
@@ -116,7 +104,8 @@ void StreamWriter::handleWrite(const std::byte* data, uint64_t size) {
   size_ += size;
 }
 
-void StreamWriter::flush() {
+void StreamWriter::flush(bool forceSync) {
+  (void)forceSync;
   stream_.flush();
 }
 
@@ -369,7 +358,7 @@ Status McapWriter::open(const std::string_view filename, const McapWriterOptions
   // If the writer was opened, close it first
   close();
   fileOutput_ = std::make_unique<FileWriter>();
-  const auto status = fileOutput_->open(filename, options.fsyncIntervalBytes);
+  const auto status = fileOutput_->open(filename);
   if (!status.ok()) {
     fileOutput_.reset();
     return status;
@@ -639,7 +628,7 @@ Status McapWriter::write(const Message& message, bool fsyncAfter) {
   }
 
   if (fsyncAfter) {
-    output.sync();
+    output.flush(true);
   }
   return StatusCode::Success;
 }

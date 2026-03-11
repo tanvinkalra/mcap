@@ -104,13 +104,6 @@ struct MCAP_PUBLIC McapWriterOptions {
   bool noStatistics = false;
   bool noSummaryOffsets = false;
 
-  /**
-   * @brief If non-zero, call fsync after every N bytes flushed to disk. Provides
-   * periodic durability guarantees. Only applies when opening with a filename
-   * (FileWriter). Default 0 disables periodic fsync.
-   */
-  uint64_t fsyncIntervalBytes = 700ULL * 1024 * 1024;  // 700 MB
-
   McapWriterOptions(const std::string_view _profile)
       : profile(_profile) {}
 };
@@ -153,16 +146,11 @@ public:
   void resetCrc();
 
   /**
-   * @brief flushes any buffered data to the output. This is called by McapWriter after every
-   * completed chunk. Callers may also retain a reference to the writer and call flush() at their
-   * own cadence. Defaults to a no-op.
+   * @brief Flushes any buffered data to the output. When forceSync is true (e.g. from
+   * write(Message, true)), also persists to storage (fsync on FileWriter). Called by
+   * McapWriter after every completed chunk. Defaults to a no-op.
    */
-  virtual void flush() {}
-  /**
-   * @brief Ensures all written data is persisted to storage (e.g. fsync on POSIX).
-   * Defaults to a no-op. Only FileWriter performs a real sync.
-   */
-  virtual void sync() {}
+  virtual void flush(bool forceSync = false) { (void)forceSync; }
 
 protected:
   virtual void handleWrite(const std::byte* data, uint64_t size) = 0;
@@ -179,25 +167,16 @@ class MCAP_PUBLIC FileWriter final : public IWritable {
 public:
   ~FileWriter() override;
 
-  /**
-   * @brief Open a file for writing.
-   * @param filename Path to the file.
-   * @param syncIntervalBytes If non-zero, call fsync after every N bytes flushed.
-   *   Default 0 disables periodic fsync.
-   */
-  Status open(std::string_view filename, uint64_t syncIntervalBytes = 0);
+  Status open(std::string_view filename);
 
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
-  void flush() override;
-  void sync() override;
+  void flush(bool forceSync = false) override;
   uint64_t size() const override;
 
 private:
   std::FILE* file_ = nullptr;
   uint64_t size_ = 0;
-  uint64_t bytesSinceLastSync_ = 0;
-  uint64_t syncIntervalBytes_ = 0;
 };
 
 /**
@@ -210,7 +189,7 @@ public:
 
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
-  void flush() override;
+  void flush(bool forceSync = false) override;
   uint64_t size() const override;
 
 private:
@@ -424,7 +403,7 @@ public:
    * @brief Write a message to the output stream.
    *
    * @param message Message to add.
-   * @param fsyncAfter If true, flush and sync to storage after this write. Default false.
+   * @param fsyncAfter If true, flush with forceSync after this write. Default false.
    * @return A non-zero error code on failure.
    */
   Status write(const Message& message, bool fsyncAfter = false);
