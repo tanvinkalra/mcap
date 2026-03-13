@@ -628,7 +628,7 @@ Status McapWriter::write(const Message& message, bool fsyncAfter) {
   }
 
   if (fsyncAfter) {
-    output.flush(true);
+    output_->flush(true);
   }
   return StatusCode::Success;
 }
