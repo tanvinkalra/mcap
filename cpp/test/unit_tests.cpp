@@ -1177,6 +1177,65 @@ TEST_CASE("Schema isolation between files with noRepeatedSchemas=false", "[write
   }
 }
 
+TEST_CASE("fsyncAfter defers chunk writes until flushFsyncNow", "[writer]") {
+  Buffer buffer;
+  mcap::McapWriter writer;
+  mcap::McapWriterOptions opts("test");
+  opts.library = "";
+  opts.noRepeatedChannels = true;
+  opts.noRepeatedSchemas = true;
+  opts.noStatistics = true;
+  opts.noSummaryOffsets = true;
+  opts.compression = mcap::Compression::None;
+  opts.chunkSize = 64;  // Small to force chunk closure logic to trigger.
+
+  writer.open(buffer, opts);
+
+  mcap::Schema schema("Example", "c", "\x04\x05\x06");
+  writer.addSchema(schema);
+  mcap::Channel channel("example", "a", schema.id, {{"foo", "bar"}});
+  writer.addChannel(channel);
+
+  const auto sizeBefore = buffer.size();
+
+  std::vector<std::byte> payload(128, std::byte{0xAB});
+
+  // Request fsync. With chunking enabled, this should not write the chunk to the
+  // destination output (it only sets an internal pending flag).
+  {
+    mcap::Message msg;
+    msg.channelId = channel.id;
+    msg.sequence = 0;
+    msg.logTime = 1;
+    msg.publishTime = 1;
+    msg.data = payload.data();
+    msg.dataSize = payload.size();
+    requireOk(writer.write(msg, /* fsyncAfter */ true));
+  }
+
+  REQUIRE(buffer.size() == sizeBefore);
+
+  // Background/async task would do this; it clears the pending flag.
+  requireOk(writer.flushFsyncNow());
+
+  // Now that pending fsync is cleared, the next write should allow the pending
+  // chunk to be written out (so the output grows).
+  {
+    mcap::Message msg;
+    msg.channelId = channel.id;
+    msg.sequence = 1;
+    msg.logTime = 2;
+    msg.publishTime = 2;
+    msg.data = payload.data();
+    msg.dataSize = payload.size();
+    requireOk(writer.write(msg, /* fsyncAfter */ false));
+  }
+
+  REQUIRE(buffer.size() > sizeBefore);
+
+  writer.close();
+}
+
 TEST_CASE("FileReader works on files larger than 2GiB") {
   std::FILE* file = std::tmpfile();
 #if defined _WIN32 || defined __CYGWIN__
