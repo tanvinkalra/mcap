@@ -9,7 +9,7 @@
 #else
 #  include <unistd.h>
 #  define MCAP_FILENO(f) fileno(f)
-#  define MCAP_FSYNC(fd) fdatasync(fd)
+#  define MCAP_FSYNC(fd) fsync(fd)
 #endif
 #ifndef MCAP_COMPRESSION_NO_LZ4
 #  include <lz4frame.h>
@@ -389,10 +389,6 @@ void McapWriter::close() {
   if (!opened_ || !output_) {
     return;
   }
-  // Stop and join the fsync worker first so it can't call flush(true) while we
-  // write the final chunk/footer records.
-  stopFsyncWorker();
-  fsyncPending_.store(false, std::memory_order_release);
   closeLastChunk();
 
   auto& fileOutput = *output_;
@@ -500,8 +496,6 @@ void McapWriter::close() {
 }
 
 void McapWriter::terminate() {
-  stopFsyncWorker();
-  fsyncPending_.store(false, std::memory_order_release);
   output_ = nullptr;
   fileOutput_.reset();
   streamOutput_.reset();
@@ -536,71 +530,6 @@ void McapWriter::terminate() {
   opened_ = false;
 }
 
-void McapWriter::startFsyncWorkerIfNeeded() {
-  // Start lazily on first `write(..., fsyncAfter=true)` call.
-  if (fsyncWorker_.joinable()) {
-    return;
-  }
-  std::lock_guard<std::mutex> lk(fsyncMutex_);
-  if (fsyncWorker_.joinable()) {
-    return;
-  }
-  fsyncWorkerStop_ = false;
-  fsyncWorker_ = std::thread(&McapWriter::fsyncWorkerLoop, this);
-}
-
-void McapWriter::stopFsyncWorker() {
-  bool joinable = false;
-  {
-    std::lock_guard<std::mutex> lk(fsyncMutex_);
-    fsyncWorkerStop_ = true;
-    joinable = fsyncWorker_.joinable();
-  }
-  fsyncCv_.notify_all();
-  if (joinable) {
-    fsyncWorker_.join();
-  }
-}
-
-void McapWriter::fsyncWorkerLoop() {
-  while (true) {
-    std::unique_lock<std::mutex> lk(fsyncMutex_);
-    fsyncCv_.wait(lk, [&] {
-      return fsyncWorkerStop_ || fsyncPending_.load(std::memory_order_acquire);
-    });
-
-    // Exit once we're stopping and there is no more pending fsync to process.
-    if (fsyncWorkerStop_ && !fsyncPending_.load(std::memory_order_acquire)) {
-      return;
-    }
-
-    // If there is a pending fsync request, perform it outside the lock.
-    lk.unlock();
-    (void)flushFsyncNow();
-  }
-}
-
-Status McapWriter::flushFsyncNow() {
-  if (!opened_ || !output_) {
-    return StatusCode::NotOpen;
-  }
-  if (!fsyncPending_.load(std::memory_order_acquire)) {
-    return StatusCode::Success;
-  }
-  // Intended to be called from a background/async task. This method may
-  // block while syncing file buffers to durable storage.
-  output_->flush(true);
-  // Avoid clearing `fsyncPending_` until the producer has finished the
-  // current `write(..., fsyncAfter=true)` call. Otherwise the producer could
-  // observe `fsyncPending_ == false` mid-call and still end up closing/writing
-  // the chunk synchronously (blocking), defeating the goal.
-  while (producerInWrite_.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  fsyncPending_.store(false, std::memory_order_release);
-  return StatusCode::Success;
-}
-
 void McapWriter::addSchema(Schema& schema) {
   schema.id = uint16_t(schemas_.size() + 1);
   schemas_.push_back(schema);
@@ -616,23 +545,6 @@ void McapWriter::addChannel(Channel& channel) {
 Status McapWriter::write(const Message& message, bool fsyncAfter) {
   if (!output_) {
     return StatusCode::NotOpen;
-  }
-  struct ProducerWriteGuard {
-    std::atomic_bool& flag;
-    explicit ProducerWriteGuard(std::atomic_bool& f) : flag(f) {
-      flag.store(true, std::memory_order_release);
-    }
-    ~ProducerWriteGuard() {
-      flag.store(false, std::memory_order_release);
-    }
-  } guard(producerInWrite_);
-  if (fsyncAfter && chunkSize_ > 0) {
-    // When chunking is enabled, avoid blocking on chunk compression/disk
-    // writes by deferring `flush(true)` to an internal background worker and
-    // preventing `writeChunk()` from running while the fsync is in progress.
-    fsyncPending_.store(true, std::memory_order_release);
-    startFsyncWorkerIfNeeded();
-    fsyncCv_.notify_one();
   }
   auto& output = getOutput();
   auto& channelMessageCounts = statistics_.channelMessageCounts;
@@ -673,10 +585,8 @@ Status McapWriter::write(const Message& message, bool fsyncAfter) {
   if (chunkWriter != nullptr && /* Chunked? */
       uncompressedSize_ != 0 && /* Current chunk is not empty/new? */
       9 + getRecordSize(message) + uncompressedSize_ >= chunkSize_ /* Overflowing? */) {
-    if (!fsyncPending_.load(std::memory_order_acquire)) {
-      auto& fileOutput = *output_;
-      writeChunk(fileOutput, *chunkWriter);
-    }
+    auto& fileOutput = *output_;
+    writeChunk(fileOutput, *chunkWriter);
   }
 
   // For the chunk-local message index.
@@ -712,16 +622,12 @@ Status McapWriter::write(const Message& message, bool fsyncAfter) {
 
     // Check if the current chunk is ready to close
     if (uncompressedSize_ >= chunkSize_) {
-      if (!fsyncPending_.load(std::memory_order_acquire)) {
-        auto& fileOutput = *output_;
-        writeChunk(fileOutput, *chunkWriter);
-      }
+      auto& fileOutput = *output_;
+      writeChunk(fileOutput, *chunkWriter);
     }
   }
 
-  // With no chunking, the message data is written directly to the underlying
-  // output, so we need to fsync synchronously to honor `fsyncAfter=true`.
-  if (fsyncAfter && chunkSize_ == 0) {
+  if (fsyncAfter) {
     output_->flush(true);
   }
   return StatusCode::Success;
@@ -731,20 +637,11 @@ Status McapWriter::write(Attachment& attachment) {
   if (!output_) {
     return StatusCode::NotOpen;
   }
-  struct ProducerWriteGuard {
-    std::atomic_bool& flag;
-    explicit ProducerWriteGuard(std::atomic_bool& f) : flag(f) {
-      flag.store(true, std::memory_order_release);
-    }
-    ~ProducerWriteGuard() {
-      flag.store(false, std::memory_order_release);
-    }
-  } guard(producerInWrite_);
   auto& fileOutput = *output_;
 
   // Check if we have an open chunk that needs to be closed
   auto* chunkWriter = getChunkWriter();
-  if (chunkWriter && !chunkWriter->empty() && !fsyncPending_.load(std::memory_order_acquire)) {
+  if (chunkWriter && !chunkWriter->empty()) {
     writeChunk(fileOutput, *chunkWriter);
   }
 
@@ -788,20 +685,11 @@ Status McapWriter::write(const Metadata& metadata) {
   if (!output_) {
     return StatusCode::NotOpen;
   }
-  struct ProducerWriteGuard {
-    std::atomic_bool& flag;
-    explicit ProducerWriteGuard(std::atomic_bool& f) : flag(f) {
-      flag.store(true, std::memory_order_release);
-    }
-    ~ProducerWriteGuard() {
-      flag.store(false, std::memory_order_release);
-    }
-  } guard(producerInWrite_);
   auto& fileOutput = *output_;
 
   // Check if we have an open chunk that needs to be closed
   auto* chunkWriter = getChunkWriter();
-  if (chunkWriter && !chunkWriter->empty() && !fsyncPending_.load(std::memory_order_acquire)) {
+  if (chunkWriter && !chunkWriter->empty()) {
     writeChunk(fileOutput, *chunkWriter);
   }
 
