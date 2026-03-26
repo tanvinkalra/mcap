@@ -3,8 +3,12 @@
 #include "types.hpp"
 #include "visibility.hpp"
 #include <cstdio>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -403,7 +407,12 @@ public:
    * @brief Write a message to the output stream.
    *
    * @param message Message to add.
-   * @param fsyncAfter If true, flush with forceSync after this write. Default false.
+   * @param fsyncAfter If true, the writer will request an fsync after the
+   * message is accepted. If chunking is enabled, the producer path will not
+   * block on chunk compression/disk writes; instead the writer schedules an
+   * internal background flush (fsync). Chunk closure may be delayed while
+   * the fsync is in flight.
+   * Default false.
    * @return A non-zero error code on failure.
    */
   Status write(const Message& message, bool fsyncAfter = false);
@@ -443,6 +452,15 @@ public:
    */
   void closeLastChunk();
 
+  /**
+   * @brief Perform a pending fsync request (if any) and clear the pending flag.
+   *
+   * Primarily useful for tests or explicit synchronization. When chunking is
+   * enabled and `write(..., fsyncAfter=true)` is used, the writer performs
+   * this automatically in the background.
+   */
+  Status flushFsyncNow();
+
   // The following static methods are used for serialization of records and
   // primitives to an output stream. They are not intended to be used directly
   // unless you are implementing a lower level writer or tests
@@ -480,6 +498,14 @@ private:
   McapWriterOptions options_{""};
   uint64_t chunkSize_ = DefaultChunkSize;
   IWritable* output_ = nullptr;
+  std::atomic_bool fsyncPending_{false};
+  // Used to prevent the fsync worker from clearing `fsyncPending_` while the
+  // producer is still executing the `write(..., fsyncAfter=true)` call.
+  std::atomic_bool producerInWrite_{false};
+  std::thread fsyncWorker_;
+  std::mutex fsyncMutex_;
+  std::condition_variable fsyncCv_;
+  bool fsyncWorkerStop_ = false;
   std::unique_ptr<FileWriter> fileOutput_;
   std::unique_ptr<StreamWriter> streamOutput_;
   std::unique_ptr<BufferWriter> uncompressedChunk_;
@@ -506,6 +532,10 @@ private:
   IWritable& getOutput();
   IChunkWriter* getChunkWriter();
   void writeChunk(IWritable& output, IChunkWriter& chunkData);
+
+  void startFsyncWorkerIfNeeded();
+  void stopFsyncWorker();
+  void fsyncWorkerLoop();
 };
 
 }  // namespace mcap
