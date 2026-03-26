@@ -151,8 +151,8 @@ public:
 
   /**
    * @brief Flushes any buffered data to the output. When forceSync is true (e.g. from
-   * write(Message, true)), also persists to storage (fsync on FileWriter). Called by
-   * McapWriter after every completed chunk. Defaults to a no-op.
+   * write(Message, true)), also persists to storage (fdatasync on POSIX FileWriter,
+   * `_commit` on Windows). Called by McapWriter after every completed chunk. Defaults to a no-op.
    */
   virtual void flush(bool forceSync = false) { (void)forceSync; }
 

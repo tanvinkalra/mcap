@@ -9,7 +9,7 @@
 #else
 #  include <unistd.h>
 #  define MCAP_FILENO(f) fileno(f)
-#  define MCAP_FSYNC(fd) fsync(fd)
+#  define MCAP_FSYNC(fd) fdatasync(fd)
 #endif
 #ifndef MCAP_COMPRESSION_NO_LZ4
 #  include <lz4frame.h>
